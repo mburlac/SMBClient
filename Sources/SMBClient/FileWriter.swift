@@ -213,7 +213,12 @@ public class FileWriter {
         ],
         fileAttributes: [.archive, .normal],
         shareAccess: [.read, .write, .delete],
-        createDisposition: .create,
+        // EC fork patch: .overwriteIf instead of .create. Upload means
+        // "replace" on every mainstream client (and on this project's
+        // other providers); .create made any upload to an existing path
+        // fail with STATUS_OBJECT_NAME_COLLISION, which broke the
+        // Replace action in overwrite-confirmation flows.
+        createDisposition: .overwriteIf,
         createOptions: [],
         name: path
       )
