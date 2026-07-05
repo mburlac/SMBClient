@@ -30,6 +30,8 @@ public class FileReader {
 
     var response: Read.Response
     repeat {
+      // EC fork patch: honor Swift task cancellation between chunks.
+      try Task.checkCancellation()
       response = try await session.read(
         fileId: fileProxy.id,
         offset: offset + UInt64(buffer.count),
@@ -43,6 +45,18 @@ public class FileReader {
   }
 
   public func download(progressHandler: (_ progress: Double) -> Void = { _ in }) async throws -> Data {
+    // EC fork patch: close the server-side handle when the download
+    // fails or is cancelled, mirroring FileWriter.upload. A leaked
+    // read handle blocks a later delete (pending delete-on-close).
+    do {
+      return try await performDownload(progressHandler: progressHandler)
+    } catch {
+      try? await close()
+      throw error
+    }
+  }
+
+  private func performDownload(progressHandler: (_ progress: Double) -> Void) async throws -> Data {
     let fileProxy = try await fileProxy()
 
     var offset: UInt64 = 0
@@ -50,6 +64,8 @@ public class FileReader {
 
     var response: Read.Response
     repeat {
+      // EC fork patch: honor Swift task cancellation between chunks.
+      try Task.checkCancellation()
       response = try await session.read(
         fileId: fileProxy.id,
         offset: offset
@@ -91,11 +107,23 @@ public class FileReader {
   }
 
   public func download(fileHandle: FileHandle, progressHandler: (_ progress: Double) -> Void = { _ in }) async throws {
+    // EC fork patch: close-on-failure, see download(progressHandler:).
+    do {
+      try await performDownload(fileHandle: fileHandle, progressHandler: progressHandler)
+    } catch {
+      try? await close()
+      throw error
+    }
+  }
+
+  private func performDownload(fileHandle: FileHandle, progressHandler: (_ progress: Double) -> Void) async throws {
     let fileProxy = try await fileProxy()
 
     var offset: UInt64 = 0
     var response: Read.Response
     repeat {
+      // EC fork patch: honor Swift task cancellation between chunks.
+      try Task.checkCancellation()
       response = try await session.read(
         fileId: fileProxy.id,
         offset: offset

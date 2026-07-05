@@ -16,6 +16,19 @@ public class FileWriter {
   }
 
   public func upload(data: Data, progressHandler: (_ progress: Double) -> Void) async throws {
+    // EC fork patch: close the server-side handle when the upload fails
+    // or is cancelled. Otherwise the handle leaks on the server and a
+    // later delete becomes a pending delete-on-close that never fires
+    // (the file looks undeletable). Upstreamable.
+    do {
+      try await performUpload(data: data, progressHandler: progressHandler)
+    } catch {
+      try? await close()
+      throw error
+    }
+  }
+
+  private func performUpload(data: Data, progressHandler: (_ progress: Double) -> Void) async throws {
     let fileProxy = try await fileProxy()
 
     var offset: UInt64 = 0
@@ -42,6 +55,16 @@ public class FileWriter {
   }
 
   public func upload(fileHandle: FileHandle, progressHandler: (_ progress: Double) -> Void) async throws {
+    // EC fork patch: close-on-failure, see upload(data:) above.
+    do {
+      try await performUpload(fileHandle: fileHandle, progressHandler: progressHandler)
+    } catch {
+      try? await close()
+      throw error
+    }
+  }
+
+  private func performUpload(fileHandle: FileHandle, progressHandler: (_ progress: Double) -> Void) async throws {
     let fileSize = try fileHandle.fileSize()
     let fileProxy = try await fileProxy()
 
