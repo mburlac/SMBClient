@@ -20,6 +20,10 @@ public class FileWriter {
 
     var offset: UInt64 = 0
     while offset < data.count {
+      // EC fork patch: honor Swift task cancellation between chunks so
+      // a cancelled transfer actually stops mid-upload instead of
+      // running the whole file to completion. Upstreamable.
+      try Task.checkCancellation()
       let buffer = data[offset..<min(offset + UInt64(session.maxWriteSize), UInt64(data.count))]
 
       _ = try await session.write(
@@ -42,6 +46,9 @@ public class FileWriter {
     let fileProxy = try await fileProxy()
 
     while true {
+      // EC fork patch: honor Swift task cancellation between chunks (see
+      // upload(data:) above).
+      try Task.checkCancellation()
       let offset = UInt64(try fileHandle.offsetInFile())
       let data = fileHandle.readData(ofLength: Int(session.maxWriteSize))
       if data.isEmpty { break }
