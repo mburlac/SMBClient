@@ -803,10 +803,18 @@ public class Session {
   }
 }
 
+// MessageIds must be unique per connection (MS-SMB2 3.2.4.1.3).
+// Concurrent requests (parallel uploads on one session) call next()
+// from different tasks, so allocation must be atomic - the previous
+// unsynchronized increment minted duplicate MessageIds under load and
+// the server dropped the connection mid-batch.
 private class SequenceNumber<I: UnsignedInteger & FixedWidthInteger> {
-  var current: I = 0
+  private var current: I = 0
+  private let lock = NSLock()
 
   func next(count: I = 1) -> I {
+    lock.lock()
+    defer { lock.unlock() }
     let next = current
     current &+= count
     return next

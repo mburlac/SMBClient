@@ -3,6 +3,12 @@ import Foundation
 public class TreeAccessor {
   public let share: String
   private let session: Session
+  // Single-flights the lazy TREE_CONNECT below. Without it, the first
+  // N concurrent operations on a fresh accessor all saw treeId == 0
+  // and each issued its own TREE_CONNECT on the shared session; the
+  // racing responses clobbered treeId and the in-flight requests
+  // failed with sharing violations / dropped connections.
+  private let connectSemaphore = Semaphore(value: 1)
 
   init(session: Session, share: String) {
     self.session = session.newSession()
@@ -134,9 +140,20 @@ public class TreeAccessor {
   }
 
   func session() async throws -> Session {
+    // Fast path: already connected.
+    if session.treeId != 0 { return session }
+    await connectSemaphore.wait()
+    defer { connectSemaphoreSignal() }
+    // Re-check under the semaphore - a concurrent caller may have
+    // connected while we waited.
     if session.treeId == 0 {
       try await session.treeConnect(path: share)
     }
     return session
+  }
+
+  private func connectSemaphoreSignal() {
+    let semaphore = connectSemaphore
+    Task { await semaphore.signal() }
   }
 }
