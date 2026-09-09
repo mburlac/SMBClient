@@ -98,6 +98,28 @@ public class TreeAccessor {
     await fileWriter.restoreFileAttributes(fileHandle, path)
   }
 
+  // EC fork patch: continue an interrupted upload. `startingAt` is where the
+  // REMOTE file resumes; `fileHandle` supplies only the bytes from that point
+  // on, which is the shape a resumed transfer already has (the source stream
+  // was itself opened at the offset). The file is opened with `.open`, not
+  // `.overwriteIf`, so it must already exist and its first `startingAt` bytes
+  // are left alone. Verifying that the remote size actually equals
+  // `startingAt` is the caller's job, not the library's.
+  public func upload(
+    fileHandle: FileHandle,
+    path: String,
+    startingAt offset: UInt64,
+    progressHandler: (_ progress: Double) -> Void
+  ) async throws {
+    let normalized = Pathname.normalize(path)
+    let fileWriter = FileWriter(session: try await session(), path: normalized, resumeOffset: offset)
+
+    try await fileWriter.upload(fileHandle: fileHandle, progressHandler: progressHandler)
+    try await fileWriter.close()
+
+    await fileWriter.restoreFileAttributes(fileHandle, normalized)
+  }
+
   public func upload(localPath: URL, remotePath path: String) async throws {
     try await upload(localPath: localPath, remotePath: path, progressHandler: { _, _, _ in })
   }

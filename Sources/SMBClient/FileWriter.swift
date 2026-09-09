@@ -6,9 +6,17 @@ public class FileWriter {
 
   private var createResponse: Create.Response?
 
-  init(session: Session, path: String) {
+  // EC fork patch: where the REMOTE file continues. When non-zero it is opened
+  // with `.open` instead of `.overwriteIf` (which truncates at CREATE - the
+  // reason upload resume was impossible), and every write lands at
+  // resumeOffset + the source's own position. The source supplies only the
+  // bytes FROM this point on; it is not the whole file.
+  private let resumeOffset: UInt64
+
+  init(session: Session, path: String, resumeOffset: UInt64 = 0) {
     self.session = session
     self.path = path.precomposedStringWithCanonicalMapping
+    self.resumeOffset = resumeOffset
   }
 
   public func upload(data: Data) async throws {
@@ -42,7 +50,8 @@ public class FileWriter {
       _ = try await session.write(
         data: buffer,
         fileId: fileProxy.id,
-        offset: offset
+        // EC fork patch: `data` holds the bytes from resumeOffset onward.
+        offset: resumeOffset + offset
       )
 
       offset += UInt64(buffer.count)
@@ -79,7 +88,9 @@ public class FileWriter {
       _ = try await session.write(
         data: data,
         fileId: fileProxy.id,
-        offset: offset
+        // EC fork patch: the handle holds only the bytes from resumeOffset on,
+        // so its own position is relative to that point.
+        offset: resumeOffset + offset
       )
 
       progressHandler(Double(offset) / Double(fileSize))
@@ -218,7 +229,8 @@ public class FileWriter {
         // other providers); .create made any upload to an existing path
         // fail with STATUS_OBJECT_NAME_COLLISION, which broke the
         // Replace action in overwrite-confirmation flows.
-        createDisposition: .overwriteIf,
+        // Resuming is the exception: `.open` keeps the partial.
+        createDisposition: resumeOffset > 0 ? .open : .overwriteIf,
         createOptions: [],
         name: path
       )
