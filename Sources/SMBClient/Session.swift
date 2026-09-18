@@ -43,7 +43,7 @@ public class Session {
 
   /// What `sign` would use right now, for tests and for a log line.
   var signingAlgorithm: String {
-    guard signingKey != nil, signingRequired, !isAnonymous else { return "none" }
+    guard signingKey != nil, signingRequired, !isAnonymous, !encryptData else { return "none" }
     return dialect.isSMB3 ? "AES-128-CMAC" : "HMAC-SHA256"
   }
 
@@ -154,6 +154,14 @@ public class Session {
     }
 
     signingRequired = response.securityMode.contains(.signingRequired) || (securityMode.contains(.signingRequired) && response.securityMode.contains(.signingEnabled))
+
+    // v2-236 M2: 3.1.1 signs whether or not anybody asked. Samba grants the
+    // session and then answers ACCESS_DENIED to the first TREE_CONNECT that
+    // arrives unsigned - a denial that reads as a permissions problem and is
+    // not one. `sign` still skips an anonymous session and an encrypted one.
+    if dialect.isSMB311 {
+      signingRequired = true
+    }
 
     maxTransactSize = response.maxTransactSize
     maxReadSize = response.maxReadSize
@@ -1005,7 +1013,10 @@ public class Session {
 #endif
 
   private func sign(_ packet: Data) -> Data {
-    if let signingKey, signingRequired, !isAnonymous {
+    // An encrypted message is not signed as well: the GCM tag is the
+    // signature (MS-SMB2 3.1.4.3), and the header inside the ciphertext goes
+    // out with the signature field zeroed.
+    if let signingKey, signingRequired, !isAnonymous, !encryptData {
       var header = Header(data: packet[..<64])
       let payload = packet[64...]
 

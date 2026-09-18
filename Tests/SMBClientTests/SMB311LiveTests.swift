@@ -98,6 +98,30 @@ final class SMB311LiveTests: XCTestCase {
     }
   }
 
+  /// 3.1.1 signs even when nobody asked. Samba grants the session and then
+  /// answers ACCESS_DENIED to the first unsigned TREE_CONNECT - a denial that
+  /// reads as a permissions problem and is not one. This is the plain fixture,
+  /// where `server signing = auto` means it demands nothing: the whole point is
+  /// that we sign anyway.
+  func testA311SessionSignsEvenWhenTheServerDoesNotAskForIt() async throws {
+    guard isReachable(port: 445) else { throw XCTSkip("samba fixture not running on :445") }
+
+    let session = Session(host: "127.0.0.1", port: 445)
+    try await session.connect()
+
+    // Signing is NOT requested: the default security mode only enables it.
+    let negotiated = try await session.negotiate()
+    XCTAssertEqual(negotiated.dialectRevision, Negotiate.Dialects.smb311.rawValue)
+
+    try await session.sessionSetup(username: "test", password: "test")
+    XCTAssertTrue(session.signingRequired, "a 3.1.1 session that does not sign is denied at tree connect")
+    XCTAssertEqual(session.signingAlgorithm, "AES-128-CMAC")
+
+    try await session.treeConnect(path: "data")
+    let files = try await session.queryDirectory(path: "", pattern: "*")
+    XCTAssertFalse(files.isEmpty)
+  }
+
   // MARK: - Encryption
 
   /// The DoD row: a share that REQUIRES encryption. Everything after session
