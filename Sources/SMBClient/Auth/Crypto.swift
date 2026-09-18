@@ -166,4 +166,124 @@ enum Crypto {
     )
     return cryptData as Data
   }
+
+  // MARK: - SMB 3.x
+
+  /// One AES-128 block, ECB, no padding. Only ever called on 16 bytes - it is
+  /// the primitive CMAC is built out of, not a way to encrypt anything.
+  private static func aesEncryptBlock(key: Data, block: Data) -> Data {
+    var out = [UInt8](repeating: 0, count: kCCBlockSizeAES128)
+    var moved = 0
+    _ = key.withUnsafeBytes { keyPtr in
+      block.withUnsafeBytes { inPtr in
+        CCCrypt(
+          CCOperation(kCCEncrypt),
+          CCAlgorithm(kCCAlgorithmAES),
+          CCOptions(kCCOptionECBMode),
+          keyPtr.baseAddress, key.count,
+          nil,
+          inPtr.baseAddress, block.count,
+          &out, out.count,
+          &moved
+        )
+      }
+    }
+    return Data(out)
+  }
+
+  /// `data << 1` over the whole buffer, with RFC 4493's constant folded back in
+  /// when the top bit was set.
+  private static func shiftLeftOne(_ data: Data) -> Data {
+    var out = [UInt8](repeating: 0, count: data.count)
+    let bytes = [UInt8](data)
+    let overflow = bytes[0] & 0x80
+    for i in 0..<bytes.count {
+      out[i] = bytes[i] << 1
+      if i + 1 < bytes.count, bytes[i + 1] & 0x80 != 0 {
+        out[i] |= 1
+      }
+    }
+    if overflow != 0 {
+      out[bytes.count - 1] ^= 0x87
+    }
+    return Data(out)
+  }
+
+  /// AES-128-CMAC (RFC 4493). SMB 3.0 / 3.0.2 sign with this; 2.x uses
+  /// HMAC-SHA256 and neither server accepts the other's signature, so the
+  /// dialect decides which one runs.
+  ///
+  /// CommonCrypto has no CMAC and neither does CryptoKit, so this is the
+  /// algorithm itself. It is pinned to RFC 4493's own test vectors - a signing
+  /// function that is quietly wrong fails as "the server dropped the
+  /// connection", which says nothing about where to look.
+  public static func aesCMAC(key: Data, data: Data) -> Data {
+    let blockSize = kCCBlockSizeAES128
+
+    let l = aesEncryptBlock(key: key, block: Data(count: blockSize))
+    let k1 = shiftLeftOne(l)
+    let k2 = shiftLeftOne(k1)
+
+    let blockCount = (data.count + blockSize - 1) / blockSize
+    let isComplete = data.count > 0 && data.count % blockSize == 0
+
+    var lastBlock: Data
+    if isComplete {
+      lastBlock = data.suffix(blockSize)
+      lastBlock = xor(lastBlock, k1)
+    } else {
+      var padded = blockCount > 0 ? Data(data.suffix(data.count - (blockCount - 1) * blockSize)) : Data()
+      padded.append(0x80)
+      padded.append(Data(count: blockSize - padded.count))
+      lastBlock = xor(padded, k2)
+    }
+
+    var x = Data(count: blockSize)
+    if blockCount > 1 {
+      for i in 0..<(blockCount - 1) {
+        let start = data.startIndex + i * blockSize
+        let block = data[start..<(start + blockSize)]
+        x = aesEncryptBlock(key: key, block: xor(x, Data(block)))
+      }
+    }
+    return aesEncryptBlock(key: key, block: xor(x, lastBlock))
+  }
+
+  private static func xor(_ a: Data, _ b: Data) -> Data {
+    Data(zip(a, b).map { $0 ^ $1 })
+  }
+
+  /// SP800-108 counter-mode KDF with HMAC-SHA256, the shape MS-SMB2 3.1.4.2
+  /// asks for. `label` and `context` are passed WITH their terminating null,
+  /// and the 0x00 between them is SP800-108's own separator - so the input
+  /// carries two consecutive nulls after "SMB2AESCMAC", which is correct and
+  /// looks like a bug every time somebody reads it.
+  ///
+  /// Only 128-bit outputs are needed (one PRF round), and asking for more
+  /// would need the counter to advance - so it refuses rather than silently
+  /// returning a short key.
+  public static func sp800108CounterKDF(key: Data,
+                                        label: Data,
+                                        context: Data,
+                                        outputBits: UInt32 = 128) -> Data {
+    precondition(outputBits <= 256, "one HMAC-SHA256 round yields at most 256 bits")
+    var input = Data()
+    input.append(contentsOf: withUnsafeBytes(of: UInt32(1).bigEndian) { Array($0) })
+    input.append(label)
+    input.append(0x00)
+    input.append(context)
+    input.append(contentsOf: withUnsafeBytes(of: outputBits.bigEndian) { Array($0) })
+    return Data(hmacSHA256(key: key, data: input).prefix(Int(outputBits) / 8))
+  }
+
+  /// MS-SMB2 3.1.4.2: the SMB 3.0 / 3.0.2 signing key. The session key is NOT
+  /// the signing key on 3.x - signing the packet with it directly is how a
+  /// 3.x handshake gets accepted and then every request rejected.
+  public static func smb3SigningKey(sessionKey: Data) -> Data {
+    sp800108CounterKDF(
+      key: sessionKey,
+      label: Data("SMB2AESCMAC\0".utf8),
+      context: Data("SmbSign\0".utf8)
+    )
+  }
 }

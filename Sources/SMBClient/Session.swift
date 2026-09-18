@@ -6,8 +6,21 @@ public class Session {
   private(set) var treeId: UInt32 = 0
 
   private var isAnonymous = false
-  private var signingRequired = false
+  /// Readable so a test can prove the signing path actually RAN. A live test
+  /// against a server that does not require signing passes without ever
+  /// reaching the algorithm, and then proves nothing about it.
+  private(set) var signingRequired = false
   private var signingKey: Data?
+  /// v2-236 M1: which dialect the server picked. It decides the signing
+  /// algorithm - 2.x is HMAC-SHA256 over the raw session key, 3.x is AES-CMAC
+  /// over a DERIVED key - and neither server accepts the other's signature.
+  private(set) var dialect: Negotiate.Dialects = .smb202
+
+  /// What `sign` would use right now, for tests and for a log line.
+  var signingAlgorithm: String {
+    guard signingKey != nil, signingRequired, !isAnonymous else { return "none" }
+    return dialect.isSMB3 ? "AES-128-CMAC" : "HMAC-SHA256"
+  }
 
   public private(set) var maxTransactSize: UInt32 = 0
   public private(set) var maxReadSize: UInt32 = 0
@@ -46,6 +59,7 @@ public class Session {
 
     session.signingRequired = signingRequired
     session.signingKey = signingKey
+    session.dialect = dialect
 
     session.maxTransactSize = maxTransactSize
     session.maxReadSize = maxReadSize
@@ -69,15 +83,22 @@ public class Session {
   @discardableResult
   public func negotiate(
     securityMode: Negotiate.SecurityMode = [.signingEnabled],
-    dialects: [Negotiate.Dialects] = [.smb202, .smb210]
+    dialects: [Negotiate.Dialects] = [.smb202, .smb210, .smb300, .smb302]
   ) async throws -> Negotiate.Response {
+    // MS-SMB2 3.2.4.2.2.1: a client that offers 3.x states its capabilities.
+    // largeMtu is the one that pays - it is what lets the server grant the
+    // multi-credit read and write sizes the transfer code already asks for.
+    let offers3x = dialects.contains { $0.rawValue >= Negotiate.Dialects.smb300.rawValue }
     let request = Negotiate.Request(
       messageId: messageId.next(),
       securityMode: securityMode,
+      capabilities: offers3x ? [.largeMtu] : [],
       dialects: dialects
     )
 
     let response = try await send(request)
+
+    dialect = Negotiate.Dialects(rawValue: response.dialectRevision) ?? .smb202
 
     signingRequired = response.securityMode.contains(.signingRequired) || (securityMode.contains(.signingRequired) && response.securityMode.contains(.signingEnabled))
 
@@ -139,7 +160,16 @@ public class Session {
       sessionId = response.header.sessionId
 
       isAnonymous = (username ?? "").isEmpty && (password ?? "").isEmpty
-      self.signingKey = signingKey
+      // 3.x does not sign with the session key: MS-SMB2 3.1.4.2 derives one.
+      //
+      // The key is installed AFTER this send, so the final SESSION_SETUP goes
+      // out unsigned - same as 2.x has always done. MS-SMB2 3.2.5.3 says it
+      // SHOULD be signed, and installing the key before the send was tried:
+      // Samba drops the connection. Since Samba accepts the unsigned form for
+      // both dialects, this matches what already worked rather than what the
+      // spec prefers. A stricter server (Windows, Synology) is where that
+      // choice would show, and that row is not paid.
+      self.signingKey = dialect.isSMB3 ? Crypto.smb3SigningKey(sessionKey: signingKey) : signingKey
 
       return response
     } else {
@@ -793,7 +823,10 @@ public class Session {
 
       header.flags = header.flags.union(.signed)
 
-      let signature = Crypto.hmacSHA256(key: signingKey, data: header.encoded() + payload)[..<16]
+      let signed = header.encoded() + payload
+      let signature = dialect.isSMB3
+        ? Crypto.aesCMAC(key: signingKey, data: signed)[..<16]
+        : Crypto.hmacSHA256(key: signingKey, data: signed)[..<16]
       header.signature = signature
 
       return header.encoded() + payload

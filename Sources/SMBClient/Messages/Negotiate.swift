@@ -20,6 +20,7 @@ public enum Negotiate {
       headerFlags: Header.Flags = [],
       messageId: UInt64,
       securityMode: SecurityMode,
+      capabilities: Capabilities = [],
       dialects: [Dialects]
     ) {
       header = Header(
@@ -36,7 +37,7 @@ public enum Negotiate {
       dialectCount = UInt16(dialects.count)
       self.securityMode = securityMode
       reserved = 0
-      capabilities = []
+      self.capabilities = capabilities
       clientGuid = UUID()
       clientStartTime = 0
       self.dialects = dialects
@@ -142,5 +143,10 @@ public enum Negotiate {
     case smb300 = 0x0300
     case smb302 = 0x0302
     case smb311 = 0x0311
+
+    /// Signing algorithm, encryption and key derivation all change at 3.0.
+    /// 3.1.1 additionally needs negotiate contexts and pre-auth integrity,
+    /// which we do not offer - so it never lands here.
+    public var isSMB3: Bool { rawValue >= Dialects.smb300.rawValue }
   }
 }
