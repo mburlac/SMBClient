@@ -287,3 +287,64 @@ enum Crypto {
     )
   }
 }
+
+// MARK: - SMB 3.1.1 (v2-236 M2)
+
+import CryptoKit
+
+extension Crypto {
+  static func sha512(_ data: Data) -> Data {
+    Data(SHA512.hash(data: data))
+  }
+
+  /// MS-SMB2 3.1.4.4.1: the pre-authentication integrity hash is a chain -
+  /// `SHA512(previous || message)` over every NEGOTIATE and SESSION_SETUP
+  /// message in both directions, starting from 64 zero bytes. It is what the
+  /// 3.1.1 keys are derived from, so a single message hashed in the wrong
+  /// order, or the wrong bytes, produces keys the server rejects without ever
+  /// saying why.
+  static func preauthHash(_ previous: Data, _ message: Data) -> Data {
+    sha512(previous + message)
+  }
+
+  /// MS-SMB2 3.1.4.2 for 3.1.1: same KDF as 3.0, different labels, and the
+  /// context is the pre-auth hash instead of a fixed string.
+  static func smb311SigningKey(sessionKey: Data, preauthHash: Data) -> Data {
+    sp800108CounterKDF(key: sessionKey,
+                       label: Data("SMBSigningKey\0".utf8),
+                       context: preauthHash)
+  }
+
+  /// Client-to-server cipher key: what WE encrypt with.
+  static func smb311ClientCipherKey(sessionKey: Data, preauthHash: Data) -> Data {
+    sp800108CounterKDF(key: sessionKey,
+                       label: Data("SMBC2SCipherKey\0".utf8),
+                       context: preauthHash)
+  }
+
+  /// Server-to-client cipher key: what we decrypt the answers with.
+  static func smb311ServerCipherKey(sessionKey: Data, preauthHash: Data) -> Data {
+    sp800108CounterKDF(key: sessionKey,
+                       label: Data("SMBS2CCipherKey\0".utf8),
+                       context: preauthHash)
+  }
+
+  /// AES-128-GCM, the only cipher we offer. CryptoKit fixes the nonce at 12
+  /// bytes, which is exactly what MS-SMB2 3.1.4.3 uses for GCM (the nonce
+  /// FIELD in the transform header is 16 bytes; the trailing four are zero and
+  /// are not part of the nonce).
+  static func aesGCMSeal(key: Data, nonce: Data, plaintext: Data, aad: Data) throws -> (ciphertext: Data, tag: Data) {
+    let box = try AES.GCM.seal(plaintext,
+                               using: SymmetricKey(data: key),
+                               nonce: AES.GCM.Nonce(data: nonce),
+                               authenticating: aad)
+    return (box.ciphertext, Data(box.tag))
+  }
+
+  static func aesGCMOpen(key: Data, nonce: Data, ciphertext: Data, tag: Data, aad: Data) throws -> Data {
+    let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: nonce),
+                                    ciphertext: ciphertext,
+                                    tag: tag)
+    return try AES.GCM.open(box, using: SymmetricKey(data: key), authenticating: aad)
+  }
+}

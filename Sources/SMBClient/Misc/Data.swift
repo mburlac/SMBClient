@@ -6,8 +6,12 @@ extension Data {
     self = Swift.withUnsafeBytes(of: &value) { Data($0) }
   }
 
+  /// `load` traps on a misaligned pointer, and a Data slice taken at an odd
+  /// offset gives exactly that - which is how reading a negotiate context list
+  /// (they sit wherever the previous one ended) crashed instead of parsing.
+  /// Nothing here is ever hot enough for the aligned variant to matter.
   func to<T>(type: T.Type) -> T {
-    return self.withUnsafeBytes { $0.load(as: T.self) }
+    return self.withUnsafeBytes { $0.loadUnaligned(as: T.self) }
   }
 }
 

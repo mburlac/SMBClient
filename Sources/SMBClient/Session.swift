@@ -16,6 +16,31 @@ public class Session {
   /// over a DERIVED key - and neither server accepts the other's signature.
   private(set) var dialect: Negotiate.Dialects = .smb202
 
+  // v2-236 M2 - 3.1.1.
+  /// The pre-auth integrity chain (MS-SMB2 3.1.4.4.1). Every NEGOTIATE and
+  /// SESSION_SETUP message feeds it, and the 3.1.1 keys come out of it.
+  private var preauthHash = Data(count: 64)
+  private(set) var negotiatedCipher: NegotiateContext.Cipher?
+  /// A cipher the server chose that we cannot run, kept so the failure can say
+  /// so instead of looking like "the server does not encrypt".
+  private(set) var unsupportedCipher: UInt16?
+  private var clientCipherKey: Data?
+  private var serverCipherKey: Data?
+  /// Nonces must never repeat under one key. Shared by reference with every
+  /// `newSession()` off this connection, exactly like the message id.
+  private var encryptionNonce = SequenceNumber<UInt64>()
+  /// The per-connection opt-in. A share that demands encryption turns it on by
+  /// itself at TREE_CONNECT regardless.
+  public var requireEncryption = false
+  private(set) var encryptData = false
+
+  /// What the wire actually carries right now, for tests and for a log line.
+  /// "none" while a test believes it is encrypting is the whole failure mode.
+  var encryptionAlgorithm: String {
+    guard encryptData, let cipher = negotiatedCipher else { return "none" }
+    return cipher == .aes128gcm ? "AES-128-GCM" : "unsupported"
+  }
+
   /// What `sign` would use right now, for tests and for a log line.
   var signingAlgorithm: String {
     guard signingKey != nil, signingRequired, !isAnonymous else { return "none" }
@@ -61,6 +86,15 @@ public class Session {
     session.signingKey = signingKey
     session.dialect = dialect
 
+    session.preauthHash = preauthHash
+    session.negotiatedCipher = negotiatedCipher
+    session.unsupportedCipher = unsupportedCipher
+    session.clientCipherKey = clientCipherKey
+    session.serverCipherKey = serverCipherKey
+    session.encryptionNonce = encryptionNonce
+    session.requireEncryption = requireEncryption
+    session.encryptData = encryptData
+
     session.maxTransactSize = maxTransactSize
     session.maxReadSize = maxReadSize
     session.maxWriteSize = maxWriteSize
@@ -73,6 +107,10 @@ public class Session {
   }
 
   public func connect() async throws {
+    // A response to an encrypted request arrives encrypted, and the transport
+    // reads an SMB2 header off the front of it to find the status - so it has
+    // to be unwrapped before anything parses it, not after.
+    connection.decrypt = { [weak self] data in self?.decrypt(data) }
     try await connection.connect()
   }
 
@@ -83,22 +121,37 @@ public class Session {
   @discardableResult
   public func negotiate(
     securityMode: Negotiate.SecurityMode = [.signingEnabled],
-    dialects: [Negotiate.Dialects] = [.smb202, .smb210, .smb300, .smb302]
+    dialects: [Negotiate.Dialects] = [.smb202, .smb210, .smb300, .smb302, .smb311]
   ) async throws -> Negotiate.Response {
     // MS-SMB2 3.2.4.2.2.1: a client that offers 3.x states its capabilities.
     // largeMtu is the one that pays - it is what lets the server grant the
     // multi-credit read and write sizes the transfer code already asks for.
     let offers3x = dialects.contains { $0.rawValue >= Negotiate.Dialects.smb300.rawValue }
+    // v2-236 M2: 3.1.1 without a pre-auth integrity context is not a lenient
+    // 3.1.1, it is a rejected one - the context is part of the dialect.
+    let offers311 = dialects.contains(.smb311)
     let request = Negotiate.Request(
       messageId: messageId.next(),
       securityMode: securityMode,
-      capabilities: offers3x ? [.largeMtu] : [],
-      dialects: dialects
+      capabilities: offers3x ? [.largeMtu, .encryption] : [],
+      dialects: dialects,
+      preauthSalt: offers311 ? Crypto.randomBytes(count: 32) : nil,
+      ciphers: offers311 ? [.aes128gcm] : []
     )
 
-    let response = try await send(request)
+    let response = try await send(request, preauth: offers311 ? .always : .none)
 
     dialect = Negotiate.Dialects(rawValue: response.dialectRevision) ?? .smb202
+
+    if dialect.isSMB311 {
+      let choice = NegotiateContext.parse(
+        response.rawMessage,
+        offset: Int(response.negotiateContextOffset),
+        count: Int(response.negotiateContextCount)
+      )
+      negotiatedCipher = choice.cipher
+      unsupportedCipher = choice.unsupportedCipher
+    }
 
     signingRequired = response.securityMode.contains(.signingRequired) || (securityMode.contains(.signingRequired) && response.securityMode.contains(.signingEnabled))
 
@@ -117,6 +170,10 @@ public class Session {
     workstation: String? = nil,
     requireSigning: Bool = false
   ) async throws -> SessionSetup.Response {
+    // 3.1.1 keeps hashing through session setup; earlier dialects have no
+    // chain at all, and hashing into one they never use would be dead work.
+    let preauthPhase: PreauthHashing = dialect.isSMB311 ? .requestAndInterimResponse : .none
+
     let negotiateMessage = NTLM.NegotiateMessage(
       domainName: domain,
       workstationName: workstation
@@ -131,7 +188,7 @@ public class Session {
       previousSessionId: 0,
       securityBuffer: securityBuffer
     )
-    let response = try await send(request)
+    let response = try await send(request, preauth: preauthPhase)
 
     if NTStatus(response.header.status) == .moreProcessingRequired {
       let challengeMessage = NTLM.ChallengeMessage(data: response.buffer)
@@ -155,7 +212,10 @@ public class Session {
         securityBuffer: authenticateMessage.encoded()
       )
 
-      let response = try await send(request)
+      // The hash is updated with THIS request and then stops: the keys are
+      // derived from the value standing when the final request went out, not
+      // from one that includes the success response.
+      let response = try await send(request, preauth: preauthPhase)
 
       sessionId = response.header.sessionId
 
@@ -169,7 +229,17 @@ public class Session {
       // both dialects, this matches what already worked rather than what the
       // spec prefers. A stricter server (Windows, Synology) is where that
       // choice would show, and that row is not paid.
-      self.signingKey = dialect.isSMB3 ? Crypto.smb3SigningKey(sessionKey: signingKey) : signingKey
+      if dialect.isSMB311 {
+        self.signingKey = Crypto.smb311SigningKey(sessionKey: signingKey, preauthHash: preauthHash)
+        clientCipherKey = Crypto.smb311ClientCipherKey(sessionKey: signingKey, preauthHash: preauthHash)
+        serverCipherKey = Crypto.smb311ServerCipherKey(sessionKey: signingKey, preauthHash: preauthHash)
+      } else {
+        self.signingKey = dialect.isSMB3 ? Crypto.smb3SigningKey(sessionKey: signingKey) : signingKey
+      }
+
+      if requireEncryption {
+        try enableEncryption()
+      }
 
       return response
     } else {
@@ -241,6 +311,13 @@ public class Session {
 
     treeId = response.header.treeId
     connectedTree = path
+
+    // MS-SMB2 3.2.5.5: a share marked SMB2_SHAREFLAG_ENCRYPT_DATA is not a
+    // suggestion - everything after this point on that tree must be encrypted,
+    // whether or not the user asked for it.
+    if response.shareFlags.contains(.encryptData), !encryptData {
+      try enableEncryption()
+    }
 
     return response
   }
@@ -720,12 +797,123 @@ public class Session {
     return try await send(request)
   }
 
-  private func send<Request: Message.Request>(_ message: Request) async throws -> Request.Response {
-    let packet = message.encoded()
-    let data = try await connection.send(sign(packet))
-    let response = Request.Response(data: data)
-    return response
+  /// How far the pre-auth chain follows a given exchange. NEGOTIATE hashes
+  /// both halves; SESSION_SETUP hashes its requests and only the INTERIM
+  /// responses - the success that ends the handshake is deliberately outside
+  /// the hash the keys are derived from.
+  enum PreauthHashing {
+    case none
+    case always
+    case requestAndInterimResponse
   }
+
+  private func send<Request: Message.Request>(_ message: Request) async throws -> Request.Response {
+    try await send(message, preauth: .none)
+  }
+
+  private func send<Request: Message.Request>(
+    _ message: Request,
+    preauth: PreauthHashing
+  ) async throws -> Request.Response {
+    let packet = sign(message.encoded())
+
+    if preauth != .none {
+      preauthHash = Crypto.preauthHash(preauthHash, packet)
+    }
+
+    let data = try await connection.send(try transform(packet))
+
+    switch preauth {
+    case .none:
+      break
+    case .always:
+      preauthHash = Crypto.preauthHash(preauthHash, data)
+    case .requestAndInterimResponse:
+      if data.count >= 64, NTStatus(Header(data: data[..<64]).status) == .moreProcessingRequired {
+        preauthHash = Crypto.preauthHash(preauthHash, data)
+      }
+    }
+
+    return Request.Response(data: data)
+  }
+
+  /// Turns on session encryption, or says exactly why it cannot. The two "no"
+  /// answers are different and a caller that cannot tell them apart will blame
+  /// the wrong side: no cipher at all means the server does not encrypt on
+  /// this dialect, a cipher we do not support means it does and we cannot.
+  func enableEncryption() throws {
+    guard dialect.isSMB311 else {
+      throw EncryptionError.dialectTooOld(dialect)
+    }
+    guard clientCipherKey != nil, serverCipherKey != nil else {
+      throw EncryptionError.noSessionKey
+    }
+    if let unsupportedCipher {
+      throw EncryptionError.unsupportedCipher(unsupportedCipher)
+    }
+    guard negotiatedCipher != nil else {
+      throw EncryptionError.notOffered
+    }
+    encryptData = true
+  }
+
+  /// Wraps a signed packet in a TRANSFORM_HEADER when the session is
+  /// encrypted. An encrypted message is not signed as well - the GCM tag IS
+  /// the signature, and MS-SMB2 3.1.4.3 says so.
+  private func transform(_ packet: Data) throws -> Data {
+    guard encryptData, let key = clientCipherKey else { return packet }
+
+    // GCM takes a 12-byte nonce; the header's field is 16 and the rest stays
+    // zero. The counter is per-key and never reused, which is the whole
+    // requirement - a repeat under one key loses the plaintext, not just the
+    // integrity.
+    var nonce = Data()
+    nonce += encryptionNonce.next() + 1
+    nonce += Data(count: 4)
+    let nonceField = nonce + Data(count: 4)
+
+    let framing = TransformHeader(
+      signature: Data(count: 16),
+      nonce: nonceField,
+      originalMessageSize: UInt32(packet.count),
+      sessionId: sessionId
+    )
+    let sealed = try Crypto.aesGCMSeal(
+      key: key,
+      nonce: nonce,
+      plaintext: packet,
+      aad: framing.associatedData()
+    )
+
+    let header = TransformHeader(
+      signature: sealed.tag,
+      nonce: nonceField,
+      originalMessageSize: UInt32(packet.count),
+      sessionId: sessionId
+    )
+    return header.encoded() + sealed.ciphertext
+  }
+
+  /// Only for a test that has to look at the bytes: a live listing cannot tell
+  /// "we encrypted" from "the server tolerated plaintext".
+  func debugTransform(_ packet: Data) throws -> Data { try transform(packet) }
+
+  /// The transport's hook. Returns nil when the message claims to be encrypted
+  /// and does not open - handing back the ciphertext would be read as an SMB2
+  /// header and reported as some unrelated protocol error.
+  private func decrypt(_ data: Data) -> Data? {
+    guard let header = TransformHeader(data: data) else { return data }
+    guard let key = serverCipherKey else { return nil }
+    return try? Crypto.aesGCMOpen(
+      key: key,
+      nonce: Data(header.nonce.prefix(12)),
+      ciphertext: Data(data[TransformHeader.size...]),
+      tag: header.signature,
+      aad: header.associatedData()
+    )
+  }
+
+
 
 #if compiler(>=5.9)
   private func send<each Request: Message.Request>(_ messages: repeat each Request) async throws -> (repeat (each Request).Response) {
@@ -754,7 +942,7 @@ public class Session {
       index += 1
     }
 
-    let responseData = try await connection.send(packet)
+    let responseData = try await connection.send(try transform(packet))
     let reader = ByteReader(responseData)
 
     var responses = [Data]()
@@ -798,7 +986,7 @@ public class Session {
 
   private func send(_ packets: Data...) async throws -> Data {
     return try await connection.send(
-      packets.enumerated().reduce(into: Data()) {
+      try transform(packets.enumerated().reduce(into: Data()) {
         let alignment = Data(count: 8 - $1.element.count % 8)
         if $1.offset < packets.count - 1 {
           let packet = $1.element + alignment
@@ -811,7 +999,7 @@ public class Session {
         } else {
           $0 += sign($1.element + alignment)
         }
-      }
+      })
     )
   }
 #endif
@@ -834,6 +1022,15 @@ public class Session {
       return packet
     }
   }
+}
+
+public enum EncryptionError: Error {
+  /// Encryption below 3.1.1 is AES-CCM, which has no implementation on Apple
+  /// platforms - so we do not offer it and must not pretend to.
+  case dialectTooOld(Negotiate.Dialects)
+  case notOffered
+  case unsupportedCipher(UInt16)
+  case noSessionKey
 }
 
 // MessageIds must be unique per connection (MS-SMB2 3.2.4.1.3).

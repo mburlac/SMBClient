@@ -4,6 +4,10 @@ import Network
 public class Connection {
   let host: String
   var onDisconnected: (Error) -> Void
+  /// v2-236 M2: unwraps a TRANSFORM_HEADER before anything here reads an SMB2
+  /// header off the front. Returns nil when an encrypted message does not
+  /// open, which is a hard failure and not a message to parse anyway.
+  var decrypt: ((Data) -> Data?)?
 
   private let connection: NWConnection
   private let queue: DispatchQueue
@@ -166,8 +170,16 @@ public class Connection {
         self.receive(upTo: length) { (result) in
           switch result {
           case .success:
-            let data = Data(self.buffer.prefix(length))
+            var data = Data(self.buffer.prefix(length))
             self.buffer = Data(self.buffer.suffix(from: length))
+
+            if TransformHeader.isEncrypted(data) {
+              guard let plaintext = self.decrypt?(data) else {
+                completion(.failure(ConnectionError.decryptionFailed))
+                return
+              }
+              data = plaintext
+            }
 
             let reader = ByteReader(data)
             var offset = 0
@@ -194,8 +206,16 @@ public class Connection {
                     return
                   }
 
-                  let data = transportPacket.smb2Message
+                  var data = transportPacket.smb2Message
                   self.buffer = Data(self.buffer.suffix(from: 4 + length))
+
+                  if TransformHeader.isEncrypted(data) {
+                    guard let plaintext = self.decrypt?(data) else {
+                      completion(.failure(ConnectionError.decryptionFailed))
+                      return
+                    }
+                    data = plaintext
+                  }
 
                   let reader = ByteReader(data)
                   let header: Header = reader.read()
@@ -268,4 +288,5 @@ public enum ConnectionError: Error {
   case disconnected
   case cancelled
   case unknown
+  case decryptionFailed
 }

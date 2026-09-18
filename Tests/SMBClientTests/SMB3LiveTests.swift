@@ -47,7 +47,13 @@ final class SMB3LiveTests: XCTestCase {
     // Signing REQUIRED, deliberately: on a server that only enables it, the
     // CMAC path never runs and this test would pass without touching the code
     // it exists for.
-    let negotiated = try await session.negotiate(securityMode: [.signingEnabled, .signingRequired])
+    // The dialect list is pinned instead of taken from the default: since
+    // v2-236 M2 the default reaches 3.1.1, and this row is M1's - a 3.0.2
+    // session signing with CMAC. 3.1.1 has its own row in SMB311LiveTests.
+    let negotiated = try await session.negotiate(
+      securityMode: [.signingEnabled, .signingRequired],
+      dialects: [.smb202, .smb210, .smb300, .smb302]
+    )
     XCTAssertEqual(negotiated.dialectRevision, Negotiate.Dialects.smb302.rawValue,
                    "offered 3.0.2, got 0x\(String(negotiated.dialectRevision, radix: 16))")
 

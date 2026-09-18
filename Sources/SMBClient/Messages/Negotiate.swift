@@ -15,13 +15,20 @@ public enum Negotiate {
     public let dialects: [Dialects]
     public let padding: Data
     public let negotiateContextList: Data
+    /// v2-236 M2: 3.1.1 reuses the 8 bytes 2.x spends on ClientStartTime for
+    /// the context offset and count. Which of the two meanings applies is
+    /// decided by the dialect list, not by a flag.
+    public let negotiateContextOffset: UInt32
+    public let negotiateContextCount: UInt16
 
     public init(
       headerFlags: Header.Flags = [],
       messageId: UInt64,
       securityMode: SecurityMode,
       capabilities: Capabilities = [],
-      dialects: [Dialects]
+      dialects: [Dialects],
+      preauthSalt: Data? = nil,
+      ciphers: [NegotiateContext.Cipher] = []
     ) {
       header = Header(
         creditCharge: 1,
@@ -41,8 +48,27 @@ public enum Negotiate {
       clientGuid = UUID()
       clientStartTime = 0
       self.dialects = dialects
-      padding = Data(count: (dialects.count * 2) % 8)
-      negotiateContextList = Data()
+
+      // Contexts start on an 8-byte boundary measured from the start of the
+      // SMB2 header, not from the start of the body.
+      let bodyEnd = 64 + 36 + dialects.count * 2
+      if dialects.contains(.smb311), let preauthSalt {
+        padding = Data(count: NegotiateContext.padding(for: bodyEnd))
+
+        var contexts = [NegotiateContext.preauthIntegrity(salt: preauthSalt)]
+        if !ciphers.isEmpty {
+          contexts.append(NegotiateContext.encryption(ciphers: ciphers))
+        }
+
+        negotiateContextList = NegotiateContext.list(contexts)
+        negotiateContextOffset = UInt32(bodyEnd + padding.count)
+        negotiateContextCount = UInt16(contexts.count)
+      } else {
+        padding = Data(count: (dialects.count * 2) % 8)
+        negotiateContextList = Data()
+        negotiateContextOffset = 0
+        negotiateContextCount = 0
+      }
     }
 
     public func encoded() -> Data {
@@ -56,7 +82,13 @@ public enum Negotiate {
       data += reserved
       data += capabilities.rawValue
       data += Data(from: clientGuid)
-      data += clientStartTime
+      if negotiateContextCount > 0 {
+        data += negotiateContextOffset
+        data += negotiateContextCount
+        data += UInt16(0)
+      } else {
+        data += clientStartTime
+      }
 
       for dialect in dialects {
         data += dialect.rawValue
@@ -85,8 +117,13 @@ public enum Negotiate {
     public let securityBufferLength: UInt16
     public let negotiateContextOffset: UInt32
     public let securityBuffer: Data
+    /// v2-236 M2: the whole message, kept because the negotiate contexts are
+    /// addressed by an offset FROM THE SMB2 HEADER - a parser handed only the
+    /// body cannot find them.
+    public let rawMessage: Data
 
     public init(data: Data) {
+      rawMessage = data
       let reader = ByteReader(data)
 
       header = reader.read()
@@ -145,8 +182,10 @@ public enum Negotiate {
     case smb311 = 0x0311
 
     /// Signing algorithm, encryption and key derivation all change at 3.0.
-    /// 3.1.1 additionally needs negotiate contexts and pre-auth integrity,
-    /// which we do not offer - so it never lands here.
     public var isSMB3: Bool { rawValue >= Dialects.smb300.rawValue }
+
+    /// 3.1.1 changes the key derivation again (the pre-auth hash replaces the
+    /// fixed context string) and is the only dialect we encrypt on.
+    public var isSMB311: Bool { self == .smb311 }
   }
 }

@@ -78,3 +78,71 @@ final class CryptoTests: XCTestCase {
                       "3.x does not sign with the session key itself")
   }
 }
+
+// MARK: - SMB 3.1.1 (v2-236 M2)
+
+extension CryptoTests {
+  /// The pre-auth chain is order-dependent by construction. If it were not,
+  /// a message hashed in the wrong place would still produce a working key and
+  /// the mistake would only show against a server that ordered them right.
+  func testPreauthHashIsAChainAndNotASet() {
+    let zero = Data(count: 64)
+    let a = Data("first".utf8)
+    let b = Data("second".utf8)
+
+    let ab = Crypto.preauthHash(Crypto.preauthHash(zero, a), b)
+    let ba = Crypto.preauthHash(Crypto.preauthHash(zero, b), a)
+
+    XCTAssertEqual(ab.count, 64)
+    XCTAssertNotEqual(ab, ba)
+  }
+
+  /// 3.1.1 derives three different keys from one session key. They must not
+  /// collide: the two cipher keys are directional, and swapping them gives a
+  /// session that encrypts fine and cannot read a single answer.
+  func testThe311KeysAreDistinct() {
+    let sessionKey = Data(repeating: 0xAB, count: 16)
+    let hash = Data(repeating: 0xCD, count: 64)
+
+    let signing = Crypto.smb311SigningKey(sessionKey: sessionKey, preauthHash: hash)
+    let c2s = Crypto.smb311ClientCipherKey(sessionKey: sessionKey, preauthHash: hash)
+    let s2c = Crypto.smb311ServerCipherKey(sessionKey: sessionKey, preauthHash: hash)
+
+    XCTAssertEqual(signing.count, 16)
+    XCTAssertEqual(c2s.count, 16)
+    XCTAssertEqual(s2c.count, 16)
+    XCTAssertNotEqual(signing, c2s)
+    XCTAssertNotEqual(c2s, s2c)
+
+    // And the hash is an input, not decoration: a different chain is a
+    // different key, which is the whole point of pre-auth integrity.
+    let other = Crypto.smb311SigningKey(sessionKey: sessionKey, preauthHash: Data(repeating: 0xCE, count: 64))
+    XCTAssertNotEqual(signing, other)
+  }
+
+  /// The transform header's associated data is authenticated but not
+  /// encrypted: a tampered session id must fail to open rather than decrypt
+  /// into something.
+  func testGCMAuthenticatesTheTransformHeader() throws {
+    let key = Data(repeating: 0x11, count: 16)
+    let nonce = Data(repeating: 0x22, count: 12)
+    let message = Data("\u{FE}SMB body".utf8)
+
+    let header = TransformHeader(signature: Data(count: 16),
+                                 nonce: nonce + Data(count: 4),
+                                 originalMessageSize: UInt32(message.count),
+                                 sessionId: 0x1234)
+    let sealed = try Crypto.aesGCMSeal(key: key, nonce: nonce, plaintext: message, aad: header.associatedData())
+
+    let opened = try Crypto.aesGCMOpen(key: key, nonce: nonce, ciphertext: sealed.ciphertext,
+                                       tag: sealed.tag, aad: header.associatedData())
+    XCTAssertEqual(opened, message)
+
+    let impostor = TransformHeader(signature: Data(count: 16),
+                                   nonce: nonce + Data(count: 4),
+                                   originalMessageSize: UInt32(message.count),
+                                   sessionId: 0x1235)
+    XCTAssertThrowsError(try Crypto.aesGCMOpen(key: key, nonce: nonce, ciphertext: sealed.ciphertext,
+                                               tag: sealed.tag, aad: impostor.associatedData()))
+  }
+}
