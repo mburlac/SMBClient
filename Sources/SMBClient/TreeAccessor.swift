@@ -22,6 +22,17 @@ public class TreeAccessor {
     }
   }
 
+  /// Runs the TREE_CONNECT now instead of on the first operation.
+  ///
+  /// v2-236 M2: the laziness moves WHERE a refusal surfaces. A share that
+  /// demands encryption denies the TREE_CONNECT, and a caller that only sees
+  /// it during a later `listDirectory` has no share name in hand any more -
+  /// so it reports the denial against the PATH, which is the confident wrong
+  /// answer v2-307 exists to avoid.
+  public func connect() async throws {
+    _ = try await session()
+  }
+
   public func listDirectory(path: String, pattern: String = "*") async throws -> [File] {
     let files = try await session().queryDirectory(path: Pathname.normalize(path), pattern: pattern)
     return files.map { File(fileInfo: $0) }
