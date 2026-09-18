@@ -107,10 +107,6 @@ public class Session {
   }
 
   public func connect() async throws {
-    // A response to an encrypted request arrives encrypted, and the transport
-    // reads an SMB2 header off the front of it to find the status - so it has
-    // to be unwrapped before anything parses it, not after.
-    connection.decrypt = { [weak self] data in self?.decrypt(data) }
     try await connection.connect()
   }
 
@@ -241,6 +237,14 @@ public class Session {
         self.signingKey = Crypto.smb311SigningKey(sessionKey: signingKey, preauthHash: preauthHash)
         clientCipherKey = Crypto.smb311ClientCipherKey(sessionKey: signingKey, preauthHash: preauthHash)
         serverCipherKey = Crypto.smb311ServerCipherKey(sessionKey: signingKey, preauthHash: preauthHash)
+
+        // The transport unwraps the TRANSFORM_HEADER before anything reads an
+        // SMB2 header off the front. The hook belongs HERE, where the key is
+        // born, and captures it by value: hanging it off a Session instead
+        // means it is missing on any connection that was never `connect()`ed
+        // explicitly (the transport dials on first send), and stale on every
+        // `newSession()` sharing this connection.
+        connection.decrypt = Session.decrypter(key: serverCipherKey)
       } else {
         self.signingKey = dialect.isSMB3 ? Crypto.smb3SigningKey(sessionKey: signingKey) : signingKey
       }
@@ -909,16 +913,18 @@ public class Session {
   /// The transport's hook. Returns nil when the message claims to be encrypted
   /// and does not open - handing back the ciphertext would be read as an SMB2
   /// header and reported as some unrelated protocol error.
-  private func decrypt(_ data: Data) -> Data? {
-    guard let header = TransformHeader(data: data) else { return data }
-    guard let key = serverCipherKey else { return nil }
-    return try? Crypto.aesGCMOpen(
-      key: key,
-      nonce: Data(header.nonce.prefix(12)),
-      ciphertext: Data(data[TransformHeader.size...]),
-      tag: header.signature,
-      aad: header.associatedData()
-    )
+  private static func decrypter(key: Data?) -> (Data) -> Data? {
+    { data in
+      guard let header = TransformHeader(data: data) else { return data }
+      guard let key else { return nil }
+      return try? Crypto.aesGCMOpen(
+        key: key,
+        nonce: Data(header.nonce.prefix(12)),
+        ciphertext: Data(data[TransformHeader.size...]),
+        tag: header.signature,
+        aad: header.associatedData()
+      )
+    }
   }
 
 

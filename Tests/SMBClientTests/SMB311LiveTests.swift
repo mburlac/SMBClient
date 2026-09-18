@@ -166,6 +166,23 @@ final class SMB311LiveTests: XCTestCase {
     }
   }
 
+  /// The path EC actually takes, which is not the one the tests above take:
+  /// `SMBClient.login` never calls `connect()` - the transport dials on first
+  /// send - and every folder goes through a `TreeAccessor`, which runs on a
+  /// `newSession()` off the same connection. Both of those broke decryption
+  /// once, and neither is visible from a test that drives `Session` directly.
+  func testEncryptionSurvivesTheClientEntryPointAndATreeAccessor() async throws {
+    try requireFixture(port: 4445, named: "samba-encrypted")
+
+    let client = SMBClient(host: "127.0.0.1", port: 4445)
+    client.session.requireEncryption = true
+    try await client.login(username: "test", password: "test")
+    XCTAssertEqual(client.session.encryptionAlgorithm, "AES-128-GCM")
+
+    let files = try await client.treeAccessor(share: "data").listDirectory(path: "")
+    XCTAssertFalse(files.isEmpty, "encrypted listing through a TreeAccessor came back empty")
+  }
+
   /// A round trip on a real session, for the one thing a live listing cannot
   /// distinguish: that we are the ones encrypting rather than the server
   /// tolerating plaintext.
