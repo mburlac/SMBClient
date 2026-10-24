@@ -154,6 +154,12 @@ public class TreeAccessor {
     FileWriter(session: try await session(), path: Pathname.normalize(path))
   }
 
+  // EC fork patch (v2-453): a writer for chunked writes, from `offset` on.
+  // Non-zero opens the existing file (`.open`) and keeps its first bytes.
+  public func fileWriter(path: String, startingAt offset: UInt64) async throws -> FileWriter {
+    FileWriter(session: try await session(), path: Pathname.normalize(path), resumeOffset: offset)
+  }
+
   public func availableSpace() async throws -> UInt64 {
     let response = try await session().queryInfo(path: "", infoType: .fileSystem, fileInfoClass: .fileFsSizeInformation)
 

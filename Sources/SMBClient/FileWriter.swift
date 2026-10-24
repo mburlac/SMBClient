@@ -59,6 +59,27 @@ public class FileWriter {
     }
   }
 
+  // EC fork patch (v2-453): a source of unknown length, written as it
+  // arrives - no temp file. Chunks land back to back from resumeOffset;
+  // `open()` creates the file even when no chunk ever comes (empty source).
+  private var streamed: UInt64 = 0
+
+  public func open() async throws {
+    _ = try await fileProxy()
+  }
+
+  public func write(chunk: Data) async throws {
+    let fileProxy = try await fileProxy()
+    var index = chunk.startIndex
+    while index < chunk.endIndex {
+      try Task.checkCancellation()
+      let end = min(index + Int(session.maxWriteSize), chunk.endIndex)
+      _ = try await session.write(data: chunk[index..<end], fileId: fileProxy.id, offset: resumeOffset + streamed)
+      streamed += UInt64(end - index)
+      index = end
+    }
+  }
+
   public func upload(fileHandle: FileHandle) async throws {
     try await upload(fileHandle: fileHandle, progressHandler: { _ in })
   }
